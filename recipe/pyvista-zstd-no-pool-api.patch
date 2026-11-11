@@ -1,0 +1,203 @@
+diff --git a/src/pyvista_zstd/_pool_compat.py b/src/pyvista_zstd/_pool_compat.py
+new file mode 100644
+index 0000000..cee169d
+--- /dev/null
++++ b/src/pyvista_zstd/_pool_compat.py
+@@ -0,0 +1,82 @@
++"""Compatibility helpers for zstandard's multi-threaded pool API.
++
++``multi_compress_to_buffer`` / ``multi_decompress_to_buffer`` are only compiled
++into python-zstandard when it is built with its bundled zstd. Conda builds that
++link the system ``libzstd`` expose the buffer types but not those methods, so
++provide equivalent helpers that keep the exact same on-disk format.
++"""
++from __future__ import annotations
++
++import os
++import struct
++import threading
++from concurrent.futures import ThreadPoolExecutor
++
++import zstandard as zstd
++
++HAS_POOL_API = "multi_compress_to_buffer" in getattr(zstd, "backend_features", set())
++
++_local = threading.local()
++
++
++def _cctx(level):
++    """Return a per-thread compressor; ZstdCompressor is not thread-safe."""
++    cached = getattr(_local, "cctx", None)
++    if cached is None or cached[0] != level:
++        cached = (level, zstd.ZstdCompressor(level=level))
++        _local.cctx = cached
++    return cached[1]
++
++
++def _dctx():
++    """Return a per-thread decompressor."""
++    cached = getattr(_local, "dctx", None)
++    if cached is None:
++        cached = zstd.ZstdDecompressor()
++        _local.dctx = cached
++    return cached
++
++
++def _workers(threads):
++    """Map zstandard's thread semantics (-1 = all cores, 0 = serial)."""
++    if threads is None or threads == 0:
++        return 0
++    return os.cpu_count() if threads == -1 else threads
++
++
++def compress_many(payloads, *, level=None, threads=0):
++    """Compress each payload into its own zstd frame."""
++    if HAS_POOL_API:
++        return zstd.ZstdCompressor(level=level).multi_compress_to_buffer(
++            payloads, threads=threads
++        )
++    n_workers = _workers(threads)
++    if n_workers and n_workers > 1 and len(payloads) > 1:
++        with ThreadPoolExecutor(max_workers=n_workers) as pool:
++            return [
++                memoryview(buf)
++                for buf in pool.map(lambda payload: _cctx(level).compress(payload), payloads)
++            ]
++    cctx = zstd.ZstdCompressor(level=level)
++    return [memoryview(cctx.compress(payload)) for payload in payloads]
++
++
++def decompress_many(blobs, *, decompressed_sizes, threads=0):
++    """Decompress frames, honouring the packed little-endian uint64 sizes."""
++    if HAS_POOL_API:
++        return zstd.ZstdDecompressor().multi_decompress_to_buffer(
++            blobs, decompressed_sizes=decompressed_sizes, threads=threads
++        )
++    sizes = struct.unpack(f"<{len(decompressed_sizes) // 8}Q", decompressed_sizes)
++    pairs = list(zip(blobs, sizes))
++    n_workers = _workers(threads)
++    if n_workers and n_workers > 1 and len(pairs) > 1:
++        with ThreadPoolExecutor(max_workers=n_workers) as pool:
++            out = pool.map(
++                lambda pair: _dctx().decompress(pair[0], max_output_size=pair[1]), pairs
++            )
++            return [memoryview(buf) for buf in out]
++    dctx = zstd.ZstdDecompressor()
++    return [
++        memoryview(dctx.decompress(blob, max_output_size=size)) for blob, size in pairs
++    ]
+diff --git a/src/pyvista_zstd/append.py b/src/pyvista_zstd/append.py
+index 2f59812..ce3c945 100644
+--- a/src/pyvista_zstd/append.py
++++ b/src/pyvista_zstd/append.py
+@@ -68,6 +68,9 @@ from typing import TYPE_CHECKING
+ import numpy as np
+ import zstandard as zstd
+ 
++from pyvista_zstd._pool_compat import compress_many
++from pyvista_zstd._pool_compat import decompress_many
++
+ from pyvista_zstd.pyvista_zstd import _FILTER_NONE
+ from pyvista_zstd.pyvista_zstd import _FILTER_SHUFFLE
+ from pyvista_zstd.pyvista_zstd import DS_METADATA_KEY
+@@ -133,8 +136,7 @@ def _decompress_two_blobs(
+     decompressed_sizes: tuple[int, int],
+ ) -> tuple[str, NDArray]:
+     """Decompress one array from its two already-sliced compressed frames."""
+-    dctx = zstd.ZstdDecompressor()
+-    segments = dctx.multi_decompress_to_buffer(
++    segments = decompress_many(
+         [meta_blob, data_blob],
+         decompressed_sizes=struct.pack("<QQ", *decompressed_sizes),
+         threads=0,
+@@ -202,7 +204,7 @@ def _load_file_meta_and_root_ds(
+ def _compress_frames(payloads: list[bytes], *, level: int) -> list[bytes]:
+     """Compress each payload into its own single-frame zstd buffer."""
+     cctx = zstd.ZstdCompressor(level=level, threads=0)
+-    buff = cctx.multi_compress_to_buffer(payloads, threads=0)
++    buff = compress_many(payloads, level=level, threads=0)
+     return [buff[i].tobytes() for i in range(len(buff))]
+ 
+ 
+diff --git a/src/pyvista_zstd/pyvista_zstd.py b/src/pyvista_zstd/pyvista_zstd.py
+index 8889f3e..1eda89f 100644
+--- a/src/pyvista_zstd/pyvista_zstd.py
++++ b/src/pyvista_zstd/pyvista_zstd.py
+@@ -58,6 +58,9 @@ from pyvista.core.pointset import StructuredGrid
+ from pyvista.core.pointset import UnstructuredGrid
+ from tqdm import tqdm
+ import zstandard as zstd
++
++from pyvista_zstd._pool_compat import compress_many
++from pyvista_zstd._pool_compat import decompress_many
+ from zstandard import BufferSegment
+ from zstandard import BufferWithSegments
+ from zstandard import BufferWithSegmentsCollection
+@@ -808,8 +811,7 @@ class Writer:
+         frame_meta: list[tuple[float, float]] = []  # (compressed_end, decompressed_size)
+         offset = 0
+         with self._filename.open("wb") as fout:
+-            cctx = zstd.ZstdCompressor(level=level, threads=n_threads)
+-            buff_seg = cctx.multi_compress_to_buffer(data, threads=n_threads)
++            buff_seg = compress_many(data, level=level, threads=n_threads)
+             for ii, cdata in enumerate(tqdm(buff_seg, disable=not progress_bar, desc="Writing frames")):
+                 offset += fout.write(cdata)
+                 frame_meta.append((offset, len(data[ii])))
+@@ -1316,7 +1318,7 @@ class Reader:
+         dctx = zstd.ZstdDecompressor()
+ 
+         # read in only the segment
+-        segments = dctx.multi_decompress_to_buffer(
++        segments = decompress_many(
+             [self._frames[index], self._frames[index + 1]],
+             decompressed_sizes=self._decompressed_sizes[index * 8 : (index + 2) * 8],
+             threads=0,  # tiny
+@@ -1351,7 +1353,7 @@ class Reader:
+         dctx = zstd.ZstdDecompressor()
+ 
+         # read in only the last segment
+-        segments = dctx.multi_decompress_to_buffer(
++        segments = decompress_many(
+             [self._frames[-2], self._frames[-1]],
+             decompressed_sizes=self._decompressed_sizes[-UID_N_CHAR:],
+             threads=0,  # tiny
+@@ -1414,8 +1416,7 @@ class Reader:
+         n_frames = len(frame_names)
+         if len(selected_frame_names) == n_frames:
+             # Decompress with multi-threaded buffer API
+-            dctx = zstd.ZstdDecompressor()
+-            segments_raw = dctx.multi_decompress_to_buffer(
++            segments_raw = decompress_many(
+                 self._frames,
+                 decompressed_sizes=self._decompressed_sizes,
+                 threads=_set_n_threads(n_threads, self.nbytes),
+@@ -1435,8 +1436,7 @@ class Reader:
+             d_sizes_bytes = b"".join(sizes)
+             ds_size = np.frombuffer(d_sizes_bytes, dtype=np.uint64).sum()
+             n_threads = _set_n_threads(n_threads, ds_size)
+-            dctx = zstd.ZstdDecompressor()
+-            segments_raw = dctx.multi_decompress_to_buffer(
++            segments_raw = decompress_many(
+                 selected_frames,
+                 decompressed_sizes=d_sizes_bytes,
+                 threads=n_threads,
+@@ -1465,8 +1465,7 @@ class Reader:
+                 sizes.append(self._decompressed_sizes[idx * 8 : (idx + 2) * 8])
+ 
+         d_sizes_bytes = b"".join(sizes)
+-        dctx = zstd.ZstdDecompressor()
+-        segments_raw = dctx.multi_decompress_to_buffer(
++        segments_raw = decompress_many(
+             selected_frames,
+             decompressed_sizes=d_sizes_bytes,
+             threads=0,
+@@ -1543,8 +1542,7 @@ class Reader:
+         # read everything
+         n_threads = _set_n_threads(n_threads, self.nbytes)
+ 
+-        dctx = zstd.ZstdDecompressor()
+-        segments_raw = dctx.multi_decompress_to_buffer(
++        segments_raw = decompress_many(
+             self._frames,
+             decompressed_sizes=self._decompressed_sizes,
+             threads=n_threads,

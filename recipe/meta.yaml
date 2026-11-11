@@ -8,6 +8,13 @@ package:
 source:
   url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name | replace('-', '_') }}-{{ version }}.tar.gz
   sha256: 73fd343171245e9f1d775bddcb049fc871a8a8e96935f5f364d78b4e8e0e2df6
+  # zstandard in `defaults` is built against the system libzstd, so its C
+  # extension lacks multi_compress_to_buffer / multi_decompress_to_buffer.
+  # This packaging-only patch routes those calls through a helper that falls
+  # back to per-frame compress/decompress (identical file format). Remove the
+  # patch once zstandard exposes the pool API (PKG-19890).
+  patches:
+    - pyvista-zstd-no-pool-api.patch
 
 build:
   number: 0
