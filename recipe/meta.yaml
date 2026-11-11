@@ -1,44 +1,60 @@
-{% set name = "<PLEASE ADD PKG NAME>" %}
-{% set version = "<PLEASE ADD PKG VERSION>" %}
+{% set name = "pyvista-zstd" %}
+{% set version = "0.3.1" %}
 
 package:
-  name: {{ name|lower }}
+  name: {{ name }}
   version: {{ version }}
 
 source:
-  url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
-  sha256: <sha256>
+  url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name | replace('-', '_') }}-{{ version }}.tar.gz
+  sha256: 73fd343171245e9f1d775bddcb049fc871a8a8e96935f5f364d78b4e8e0e2df6
 
 build:
   number: 0
   script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
-  skip: True  # [py<38]
+  skip: true  # [py<310]
 
 requirements:
   host:
     - python
     - pip
+    - setuptools >=64
+    - setuptools-scm >=8
   run:
     - python
+    - pyvista >=0.45.0
+    - tqdm >=4.0.0
+    - zstandard >=0.24.0
 
 test:
+  source_files:
+    - tests
   imports:
-    - {{ name.replace('-', '.') }}
-  requires:
-    - pip
+    - pyvista_zstd
   commands:
     - pip check
+    - python -c "from packaging.version import parse; import pyvista_zstd; assert parse(pyvista_zstd.__version__) == parse('{{ version }}'), pyvista_zstd.__version__"
+    - pytest -vv tests
+  requires:
+    - pip
+    - packaging
+    - pytest
+    - pytest-cov
+    - numpy
 
 about:
-  home: <PLEASE ADD HOME URL>
-  summary: <PLEASE ADD SUMMARY>
+  home: https://github.com/pyvista/pyvista-zstd
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: VTK zstandard compression library.
   description: |
-    <PLEASE ADD DESCRIPTION>
-  license: <PLEASE ADD LICENSE>
-  license_family: <PLEASE ADD LICENSE_FAMILY>
-  license_file: <PLEASE_ADD_LICENSE_FILE>
-  dev_url: <PLEASE ADD DEV URL>
-  doc_url: <PLEASE ADD DOC URL>
+    pyvista-zstd is a zstandard compression library for VTK-based file formats.
+    It registers PyVista reader and writer entry points for the ``.pv`` and
+    ``.zvtk`` extensions, letting PyVista read and write zstandard-compressed
+    VTK datasets.
+  doc_url: https://github.com/pyvista/pyvista-zstd
+  dev_url: https://github.com/pyvista/pyvista-zstd
 
 extra:
   recipe-maintainers:
